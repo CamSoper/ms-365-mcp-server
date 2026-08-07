@@ -10,6 +10,7 @@
     "pathPattern": "/me/messages",
     "method": "get",
     "toolName": "list-mail-messages",
+    "descriptionOverride": "List, search, and filter Outlook email messages in the signed-in user's mailbox across all folders. Returns message metadata (subject, from, receivedDateTime, isRead, hasAttachments) plus a body preview. Use $search for keyword queries, $filter to narrow by sender/read state/date, $top to limit page size, and $select to trim fields.",
     "presets": ["mail", "outlook", "personal"],
     "scopes": ["Mail.Read"],
     "llmTip": "List read search my Outlook emails across folders. CRITICAL: When searching emails, the $search parameter value MUST be wrapped in double quotes. Format: $search=\"your search query here\". Use KQL (Keyword Query Language) syntax to search specific properties: 'from:', 'subject:', 'body:', 'to:', 'cc:', 'bcc:', 'attachment:', 'hasAttachments:', 'importance:', 'received:', 'sent:'. Examples: $search=\"from:john@example.com\" | $search=\"subject:meeting AND hasAttachments:true\" | $search=\"body:urgent AND received>=2024-01-01\" | $search=\"from:john AND importance:high\". Remember: ALWAYS wrap the entire search expression in double quotes! Reference: https://learn.microsoft.com/en-us/graph/search-query-parameter IMPORTANT: Always use $select to limit returned fields and reduce response size. Recommended default: $select=id,subject,from,toRecipients,receivedDateTime,bodyPreview,isRead,hasAttachments. Use bodyPreview instead of body for listings. To read the full email body, use get-mail-message with the specific message id."
@@ -72,6 +73,7 @@
     "pathPattern": "/me/messages/{message-id}",
     "method": "get",
     "toolName": "get-mail-message",
+    "descriptionOverride": "Get a single Outlook email message by its message ID, including full subject, sender, recipients, body, and attachment flags. Use list-mail-messages first to obtain the message ID.",
     "presets": ["mail", "outlook", "personal"],
     "scopes": ["Mail.Read"]
   },
@@ -157,6 +159,7 @@
     "pathPattern": "/me/messages",
     "method": "post",
     "toolName": "create-draft-email",
+    "descriptionOverride": "Create a draft Outlook email message in the signed-in user's Drafts folder. Set subject, body, toRecipients, ccRecipients, and importance. The draft is saved, not sent — use send-mail to send a message directly, or send the draft afterwards.",
     "presets": ["mail", "outlook", "personal"],
     "scopes": ["Mail.ReadWrite"]
   },
@@ -164,6 +167,7 @@
     "pathPattern": "/me/messages/{message-id}",
     "method": "delete",
     "toolName": "delete-mail-message",
+    "descriptionOverride": "Delete an Outlook email message by its message ID. This is a soft delete that moves the message to Deleted Items.",
     "presets": ["mail", "outlook", "personal"],
     "scopes": ["Mail.ReadWrite"],
     "llmTip": "Soft delete — moves to Deleted Items. To permanently delete, delete again from Deleted Items."
@@ -180,6 +184,7 @@
     "pathPattern": "/me/messages/{message-id}",
     "method": "patch",
     "toolName": "update-mail-message",
+    "descriptionOverride": "Update an existing Outlook email message by its message ID — for example mark it read or unread (isRead), flag it (flag), change its categories, importance, or edit a draft's subject, body, or recipients.",
     "presets": ["mail", "outlook", "personal"],
     "scopes": ["Mail.ReadWrite"]
   },
@@ -702,7 +707,102 @@
     "isExcelOp": true,
     "scopes": ["Files.ReadWrite"],
     "skipEncoding": ["address"],
-    "llmTip": "Apply rangeFormat properties to a specific range. Required path param 'address' (e.g. 'A1:E5' or 'Sheet1!A1:E5'). Body: { horizontalAlignment, verticalAlignment, wrapText, columnWidth, rowHeight }. Note: font, fill, and borders are sub-resources on rangeFormat — set them via /format/font, /format/fill, and /format/borders/{sideIndex} respectively, not on this endpoint."
+    "llmTip": "Apply rangeFormat properties to a specific range. Required path param 'address' (e.g. 'A1:E5' or 'Sheet1!A1:E5'). Body: { horizontalAlignment, verticalAlignment, wrapText, columnWidth, rowHeight }. Font, fill, and borders are NOT set here; use format-excel-range-font, format-excel-range-fill, and format-excel-range-border for those."
+  },
+  {
+    "pathPattern": "/drives/{drive-id}/items/{driveItem-id}/workbook/worksheets/{workbookWorksheet-id}/range(address='{address}')/format",
+    "method": "get",
+    "toolName": "get-excel-range-format",
+    "presets": ["excel", "personal"],
+    "isExcelOp": true,
+    "scopes": ["Files.Read"],
+    "skipEncoding": ["address"],
+    "llmTip": "Reads a range's format: alignment, wrapText, columnWidth, rowHeight. Font, fill, and borders are nested and omitted by default; add font, fill, and borders to the $expand parameter to include them in one call. Cell styling often encodes meaning (a fill or font color flagging status such as tentative or reconciled), so expand these to interpret what the cells mean."
+  },
+  {
+    "pathPattern": "/drives/{drive-id}/items/{driveItem-id}/workbook/worksheets/{workbookWorksheet-id}/range(address='{address}')/format/font",
+    "method": "patch",
+    "toolName": "format-excel-range-font",
+    "presets": ["excel", "personal"],
+    "isExcelOp": true,
+    "scopes": ["Files.ReadWrite"],
+    "skipEncoding": ["address"],
+    "llmTip": "Set font formatting on a range: bold, italic, underline, size, color, and font name.",
+    "requestBodySchema": {
+      "type": "object",
+      "description": "Font style applied to every cell in the range. Send only the properties you want to change.",
+      "properties": {
+        "bold": { "type": "boolean" },
+        "italic": { "type": "boolean" },
+        "underline": {
+          "type": "string",
+          "enum": ["None", "Single", "Double", "SingleAccountant", "DoubleAccountant"]
+        },
+        "size": { "type": "number", "description": "Font size in points." },
+        "color": {
+          "type": "string",
+          "description": "HTML color code for the text, e.g. #FF0000 or a named color like 'red'."
+        },
+        "name": { "type": "string", "description": "Font name, e.g. 'Calibri'." }
+      }
+    }
+  },
+  {
+    "pathPattern": "/drives/{drive-id}/items/{driveItem-id}/workbook/worksheets/{workbookWorksheet-id}/range(address='{address}')/format/fill",
+    "method": "patch",
+    "toolName": "format-excel-range-fill",
+    "presets": ["excel", "personal"],
+    "isExcelOp": true,
+    "scopes": ["Files.ReadWrite"],
+    "skipEncoding": ["address"],
+    "llmTip": "Set the background fill color of a range's cells.",
+    "requestBodySchema": {
+      "type": "object",
+      "description": "Background fill applied to every cell in the range.",
+      "properties": {
+        "color": {
+          "type": "string",
+          "description": "HTML color code for the background, e.g. #FFFF00 or a named color like 'yellow'."
+        }
+      }
+    }
+  },
+  {
+    "pathPattern": "/drives/{drive-id}/items/{driveItem-id}/workbook/worksheets/{workbookWorksheet-id}/range(address='{address}')/format/borders/{sideIndex}",
+    "method": "patch",
+    "toolName": "format-excel-range-border",
+    "presets": ["excel"],
+    "isExcelOp": true,
+    "scopes": ["Files.ReadWrite"],
+    "skipEncoding": ["address"],
+    "llmTip": "Sets one border side. The {sideIndex} path param selects which side: EdgeTop, EdgeBottom, EdgeLeft, EdgeRight, InsideVertical, InsideHorizontal, DiagonalDown, or DiagonalUp. To outline all four edges, call once per side.",
+    "requestBodySchema": {
+      "type": "object",
+      "description": "Line style for the chosen border side.",
+      "properties": {
+        "style": {
+          "type": "string",
+          "enum": [
+            "None",
+            "Continuous",
+            "Dash",
+            "DashDot",
+            "DashDotDot",
+            "Dot",
+            "Double",
+            "SlantDashDot"
+          ]
+        },
+        "weight": {
+          "type": "string",
+          "enum": ["Hairline", "Thin", "Medium", "Thick"]
+        },
+        "color": {
+          "type": "string",
+          "description": "HTML color code for the line, e.g. #000000 or a named color like 'black'."
+        }
+      }
+    }
   },
   {
     "pathPattern": "/drives/{drive-id}/items/{driveItem-id}/workbook/worksheets/{workbookWorksheet-id}/range()/sort",
@@ -725,6 +825,7 @@
     "pathPattern": "/me/messages/{message-id}/$value",
     "method": "get",
     "toolName": "get-mail-message-mime",
+    "descriptionOverride": "Download the raw MIME source (RFC 822 .eml content) of an Outlook email message by its message ID. Returns the complete original message including headers and encoded attachments.",
     "presets": ["mail", "outlook", "personal"],
     "scopes": ["Mail.Read"],
     "acceptType": "text/plain",
@@ -1710,56 +1811,56 @@
     "method": "get",
     "toolName": "get-sharepoint-site",
     "presets": ["work"],
-    "workScopes": ["Sites.Read.All"]
+    "workScopes": [["Sites.Read.All"], ["Sites.Selected"]]
   },
   {
     "pathPattern": "/sites/{site-id}/drives",
     "method": "get",
     "toolName": "list-sharepoint-site-drives",
     "presets": ["work"],
-    "workScopes": ["Sites.Read.All"]
+    "workScopes": [["Sites.Read.All"], ["Sites.Selected"]]
   },
   {
     "pathPattern": "/sites/{site-id}/drives/{drive-id}",
     "method": "get",
     "toolName": "get-sharepoint-site-drive-by-id",
     "presets": ["work"],
-    "workScopes": ["Sites.Read.All"]
+    "workScopes": [["Sites.Read.All"], ["Sites.Selected"]]
   },
   {
     "pathPattern": "/sites/{site-id}/items",
     "method": "get",
     "toolName": "list-sharepoint-site-items",
     "presets": ["work"],
-    "workScopes": ["Sites.Read.All"]
+    "workScopes": [["Sites.Read.All"], ["Sites.Selected"]]
   },
   {
     "pathPattern": "/sites/{site-id}/items/{baseItem-id}",
     "method": "get",
     "toolName": "get-sharepoint-site-item",
     "presets": ["work"],
-    "workScopes": ["Sites.Read.All"]
+    "workScopes": [["Sites.Read.All"], ["Sites.Selected"]]
   },
   {
     "pathPattern": "/sites/{site-id}/lists",
     "method": "get",
     "toolName": "list-sharepoint-site-lists",
     "presets": ["work"],
-    "workScopes": ["Sites.Read.All"]
+    "workScopes": [["Sites.Read.All"], ["Sites.Selected"]]
   },
   {
     "pathPattern": "/sites/{site-id}/lists/{list-id}",
     "method": "get",
     "toolName": "get-sharepoint-site-list",
     "presets": ["work"],
-    "workScopes": ["Sites.Read.All"]
+    "workScopes": [["Sites.Read.All"], ["Sites.Selected"]]
   },
   {
     "pathPattern": "/sites/{site-id}/lists/{list-id}/items",
     "method": "get",
     "toolName": "list-sharepoint-site-list-items",
     "presets": ["work"],
-    "workScopes": ["Sites.Read.All"],
+    "workScopes": [["Sites.Read.All"], ["Sites.Selected"]],
     "llmTip": "Add $expand=fields to include actual column values. Without it, only metadata is returned."
   },
   {
@@ -1767,7 +1868,7 @@
     "method": "get",
     "toolName": "get-sharepoint-site-list-item",
     "presets": ["work"],
-    "workScopes": ["Sites.Read.All"],
+    "workScopes": [["Sites.Read.All"], ["Sites.Selected"]],
     "llmTip": "Add $expand=fields to include actual column values. Without it, only metadata is returned."
   },
   {
@@ -1775,7 +1876,7 @@
     "method": "post",
     "toolName": "create-sharepoint-list-item",
     "presets": ["work"],
-    "workScopes": ["Sites.ReadWrite.All"],
+    "workScopes": [["Sites.ReadWrite.All"], ["Sites.Selected"]],
     "llmTip": "Creates a new item in a SharePoint list. Body: { fields: { Title: 'Item name', ColumnName: 'value', ... } }. Use list-sharepoint-site-lists to find the list ID and get-sharepoint-site-list to discover available columns."
   },
   {
@@ -1783,7 +1884,7 @@
     "method": "patch",
     "toolName": "update-sharepoint-list-item",
     "presets": ["work"],
-    "workScopes": ["Sites.ReadWrite.All"],
+    "workScopes": [["Sites.ReadWrite.All"], ["Sites.Selected"]],
     "llmTip": "Updates fields on an existing list item. Body: { fields: { ColumnName: 'new value' } }. Send only the fields you want to change. Use $expand=fields on get-sharepoint-site-list-item to see current values first."
   },
   {
@@ -1791,7 +1892,7 @@
     "method": "delete",
     "toolName": "delete-sharepoint-list-item",
     "presets": ["work"],
-    "workScopes": ["Sites.ReadWrite.All"],
+    "workScopes": [["Sites.ReadWrite.All"], ["Sites.Selected"]],
     "llmTip": "Deletes a list item permanently. This cannot be undone — the item is moved to the site recycle bin."
   },
   {
@@ -1799,7 +1900,7 @@
     "method": "post",
     "toolName": "create-sharepoint-list",
     "presets": ["work"],
-    "workScopes": ["Sites.Manage.All"],
+    "workScopes": [["Sites.Manage.All"], ["Sites.Selected"]],
     "llmTip": "Creates a new SharePoint list in a site. Body: { displayName: 'My List', description: 'Optional', list: { template: 'genericList' }, columns: [ { name: 'Status', text: {} }, { name: 'Due', dateTime: {} } ] }. Templates include genericList, documentLibrary, tasks, calendar, contacts, links, announcements, survey. Columns can be defined inline at creation; otherwise add them later via create-sharepoint-list-column. Use search-sharepoint-sites or get-sharepoint-site-by-path to find the site ID first."
   },
   {
@@ -1807,7 +1908,7 @@
     "method": "get",
     "toolName": "list-sharepoint-list-columns",
     "presets": ["work"],
-    "workScopes": ["Sites.Read.All"],
+    "workScopes": [["Sites.Read.All"], ["Sites.Selected"]],
     "llmTip": "Lists column definitions for a SharePoint list. Returns each column's id, name, displayName, description, type indicator (text, number, choice, dateTime, person, lookup, boolean, calculated, hyperlinkOrPicture, etc.), required, indexed, hidden, readOnly. Use this to discover the schema before creating or updating list items."
   },
   {
@@ -1815,7 +1916,7 @@
     "method": "post",
     "toolName": "create-sharepoint-list-column",
     "presets": ["work"],
-    "workScopes": ["Sites.Manage.All"],
+    "workScopes": [["Sites.Manage.All"], ["Sites.Selected"]],
     "llmTip": "Creates a new column on a SharePoint list. Body must include name and exactly one column type property: { name: 'Priority', text: {} } or { name: 'DueDate', dateTime: { format: 'dateOnly' } } or { name: 'Status', choice: { choices: ['Open','In Progress','Done'] } }. Other types: number, boolean, currency, hyperlinkOrPicture, personOrGroup, lookup, calculated. Optional: displayName, description, required, indexed, enforceUniqueValues."
   },
   {
@@ -1823,7 +1924,7 @@
     "method": "get",
     "toolName": "get-sharepoint-list-column",
     "presets": ["work"],
-    "workScopes": ["Sites.Read.All"],
+    "workScopes": [["Sites.Read.All"], ["Sites.Selected"]],
     "llmTip": "Gets a specific column definition by ID, including its full type configuration (choices for choice columns, format for dateTime, etc.). Use list-sharepoint-list-columns first to find the column ID."
   },
   {
@@ -1831,7 +1932,7 @@
     "method": "patch",
     "toolName": "update-sharepoint-list-column",
     "presets": ["work"],
-    "workScopes": ["Sites.Manage.All"],
+    "workScopes": [["Sites.Manage.All"], ["Sites.Selected"]],
     "llmTip": "Updates a column definition. Body: { displayName: 'New name', description: 'New description', required: true, ... }. The column type itself (text, choice, etc.) cannot be changed — only its metadata and per-type options (e.g. choices array for a choice column). Send only the fields you want to change."
   },
   {
@@ -1839,15 +1940,17 @@
     "method": "delete",
     "toolName": "delete-sharepoint-list-column",
     "presets": ["work"],
-    "workScopes": ["Sites.Manage.All"],
+    "workScopes": [["Sites.Manage.All"], ["Sites.Selected"]],
     "llmTip": "Deletes a column from a SharePoint list. This is irreversible — all data stored in this column across every list item is lost. Confirm with the user before calling. Cannot delete built-in columns (Title, Created, Modified, etc.)."
   },
   {
-    "pathPattern": "/sites/{site-id}/getByPath(path='{path}')",
+    "pathPattern": "/sites/{site-id}:/{path}",
     "method": "get",
     "toolName": "get-sharepoint-site-by-path",
     "presets": ["work"],
-    "workScopes": ["Sites.Read.All"]
+    "workScopes": [["Sites.Read.All"], ["Sites.Selected"]],
+    "skipEncoding": ["path"],
+    "llmTip": "Resolve a SharePoint site from its server-relative URL. site-id is the hostname (contoso.sharepoint.com) and path is the site path without a leading slash (sites/marketing, teams/hr). Returns the site object whose id feeds list-sharepoint-site-drives."
   },
   {
     "pathPattern": "/sites/delta()",
