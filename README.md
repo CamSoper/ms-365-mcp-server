@@ -166,6 +166,42 @@ npx @softeria/ms-365-mcp-server \
 
 In HTTP mode, OAuth discovery advertises the effective filtered permissions so clients request the same consent surface. On-Behalf-Of mode (`--obo`) still advertises `api://<clientId>/access_as_user` for protected-resource metadata; `--allowed-scopes` does not override OBO.
 
+### Send Allowlist (outbound recipient policy)
+
+A server holding both mail-read and mail-send tools is a data-exfiltration hazard under prompt
+injection: a hostile email can steer the model into forwarding mailbox contents to an attacker
+address. `MS365_MCP_SEND_ALLOWLIST` bounds where mail can go, enforced server-side (below the
+model), while keeping send tools usable:
+
+```bash
+MS365_MCP_SEND_ALLOWLIST='me@example.com, family@example.com, *@mydomain.example' \
+  npx @softeria/ms-365-mcp-server --http 3000
+```
+
+The value is a comma- or whitespace-separated list of addresses and/or `*@domain` patterns
+(case-insensitive). Unset or empty disables the policy entirely (the default — no behavior change).
+
+When enabled:
+
+- `send-mail`, `reply-*`, and `forward-mail-message` calls whose recipients are all allowlisted
+  proceed unchanged. If **any** recipient (to/cc/bcc, and for replies the original sender and
+  reply-all audience) is not allowlisted, the send is **redirected to a Drafts twin**
+  (`createReply`/`createReplyAll`/`createForward`, or draft creation for `send-mail`): nothing
+  leaves the mailbox, the response carries a `policy` note naming the blocked recipients, and the
+  user can review and send from Outlook.
+- `send-draft-message` looks up the stored draft's recipients first and **refuses** (leaving the
+  draft intact) if any are blocked.
+- Calendar operations that email invites (`create-calendar-event` / `update-calendar-event` with
+  attendees, `forward-calendar-event`) are **refused** when an attendee/recipient is not
+  allowlisted — events have no draft state, and silently stripping attendees would be surprising.
+- `graph-batch` sub-requests matching any policed action are refused wholesale, so the batch
+  passthrough cannot bypass the policy.
+
+Include the mailbox owner's own address in the list — reply-all recipient sets usually contain it.
+Denials and draft redirections are recorded in the structured audit log. Known v1 gap: Teams
+chat/channel sends are not policed (exclude them with `--enabled-tools` if that matters for your
+deployment).
+
 ### Requesting extra scopes
 
 `--allowed-scopes` only ever _narrows_ the token request. To request a Graph scope that no bundled tool needs — for example to drive an endpoint via `graph-batch` — use `--extra-scopes` (or `MS365_MCP_EXTRA_SCOPES`). These scopes are appended verbatim to the token request, on top of the tool-derived scopes.
