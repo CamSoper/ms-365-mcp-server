@@ -4,6 +4,7 @@ import logger from './logger.js';
 import { auditLog, getUserIdentityForAudit } from './audit-log.js';
 import GraphClient from './graph-client.js';
 import { isDestructiveOperation } from './lib/destructive-ops.js';
+import { applyRecipientPolicy, isRecipientPolicyEnabled } from './lib/recipient-policy.js';
 import { describePathParam } from './lib/path-params.js';
 import AuthManager, {
   getEndpointScopeGroups,
@@ -1167,6 +1168,100 @@ async function executeGraphTool(
         .map(([key, value]) => `${key}=${encodeURIComponent(value).replace(/%2C/gi, ',')}`)
         .join('&');
       path = `${path}${path.includes('?') ? '&' : '?'}${queryString}`;
+    }
+
+    // Outbound recipient allowlist (MS365_MCP_SEND_ALLOWLIST) — evaluated
+    // here because this is the last point where the resolved path and the
+    // structured (pre-serialization) body both exist. See lib/recipient-policy.ts.
+    if (isRecipientPolicyEnabled() && tool.method.toLowerCase() !== 'get') {
+      const policyFetchJson = async (lookupPath: string): Promise<Record<string, unknown>> => {
+        const resp = await graphClient.graphRequest(lookupPath, {
+          method: 'GET',
+          headers: {},
+          accessToken: accountAccessToken,
+          forceJsonOutput: true,
+        });
+        const text = resp?.content?.[0]?.text;
+        if (resp?.isError || typeof text !== 'string') {
+          throw new Error('recipient policy lookup failed');
+        }
+        return JSON.parse(text) as Record<string, unknown>;
+      };
+      const decision = await applyRecipientPolicy({
+        pathPattern: config?.pathPattern ?? tool.path,
+        resolvedPath: path,
+        method: tool.method,
+        body,
+        fetchJson: policyFetchJson,
+      });
+      if (decision.action === 'deny') {
+        auditLog({
+          event: 'tool_call_denied_recipient_policy',
+          request_id: requestId,
+          user_principal_name: upn,
+          tool: tool.alias,
+          http_method: httpMethod,
+          status: 'denied',
+          duration_ms: Date.now() - startTime,
+          error_type: 'recipient_policy_violation',
+        });
+        logger.warn(
+          `Recipient policy denied ${tool.alias}: ${decision.reason} (blocked: ${decision.blockedRecipients.join(', ')})`
+        );
+        return {
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify({
+                error: 'recipient_policy_violation',
+                tool: tool.alias,
+                blockedRecipients: decision.blockedRecipients,
+                message: decision.reason,
+              }),
+            },
+          ],
+          isError: true,
+        };
+      }
+      if (decision.action === 'rewrite') {
+        auditLog({
+          event: 'tool_call_redirected_to_draft',
+          request_id: requestId,
+          user_principal_name: upn,
+          tool: tool.alias,
+          http_method: httpMethod,
+          status: 'success',
+          duration_ms: Date.now() - startTime,
+        });
+        logger.warn(
+          `Recipient policy redirected ${tool.alias} to draft at ${decision.path} (blocked: ${decision.note.blockedRecipients.join(', ')})`
+        );
+        const draftResp = await graphClient.graphRequest(decision.path, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(decision.body ?? {}),
+          accessToken: accountAccessToken,
+          forceJsonOutput: true,
+        });
+        const draftText = draftResp?.content?.[0]?.text;
+        let draftResult: unknown = draftText;
+        if (typeof draftText === 'string') {
+          try {
+            draftResult = JSON.parse(draftText);
+          } catch {
+            // keep raw text
+          }
+        }
+        return {
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify({ policy: decision.note, result: draftResult }),
+            },
+          ],
+          ...(draftResp?.isError ? { isError: true } : {}),
+        };
+      }
     }
 
     const options: {
