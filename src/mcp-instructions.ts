@@ -8,7 +8,7 @@ export type McpInstructionsContext = {
 function buildGeneralMcpInstructions(opts: McpInstructionsContext): string {
   const parts = [
     'Microsoft 365 MCP exposes Microsoft Graph through MCP tools. Use each tool name, description, and parameter schema as the source of truth.',
-    'Microsoft Graph OData: do not combine $filter with $search on the same request. For lists, prefer modest $top (or top) and $select; avoid very large pages unless the user needs them.',
+    'Microsoft Graph OData: do not combine $filter with $search on the same request. For lists, prefer modest $top (or top), plus $select where the tool schema offers it (some endpoints, such as Microsoft To Do, reject it with a 400); avoid very large pages unless the user needs them.',
     'Mail and message $search uses KQL; the $search query parameter value must be double-quoted per Graph (see search-query-parameter in Microsoft Graph docs).',
     'When you need an organizational user or recipient address, resolve it with list-users (or another directory tool); do not invent SMTP addresses.',
     'Directory $search on collections such as /users or /groups requires ConsistencyLevel: eventual when the tool exposes that header.',

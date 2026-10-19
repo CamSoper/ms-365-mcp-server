@@ -11,10 +11,13 @@ API.
 
 This server supports multiple Microsoft cloud environments:
 
-| Cloud                | Description                        | Auth Endpoint             | Graph API Endpoint              |
-| -------------------- | ---------------------------------- | ------------------------- | ------------------------------- |
-| **Global** (default) | International Microsoft 365        | login.microsoftonline.com | graph.microsoft.com             |
-| **China** (21Vianet) | Microsoft 365 operated by 21Vianet | login.chinacloudapi.cn    | microsoftgraph.chinacloudapi.cn |
+| Cloud                | Description                          | Auth Endpoint             | Graph API Endpoint              |
+| -------------------- | ------------------------------------ | ------------------------- | ------------------------------- |
+| **Global** (default) | International Microsoft 365          | login.microsoftonline.com | graph.microsoft.com             |
+| **China** (21Vianet) | Microsoft 365 operated by 21Vianet   | login.chinacloudapi.cn    | microsoftgraph.chinacloudapi.cn |
+| **GCC High**         | Microsoft 365 US Government GCC High | login.microsoftonline.us  | graph.microsoft.us              |
+
+GCC High has no pre-registered client: register an app in your government tenant and set `MS365_MCP_CLIENT_ID` (and `MS365_MCP_TENANT_ID`), then use `--cloud gcc-high`.
 
 To route Graph traffic through a proxy of your own (one that terminates the client's plain HTTP and originates TLS to Microsoft), set `MS365_MCP_GRAPH_BASE_URL` to its base URL; see the environment variable list under CLI Options, including what still bypasses it.
 
@@ -673,7 +676,7 @@ The following options can be used when running ms-365-mcp-server directly from t
 --org-mode        Enable organization/work mode from start (includes Teams, SharePoint, etc.)
 --work-mode       Alias for --org-mode
 --force-work-scopes Backwards compatibility alias for --org-mode (deprecated)
---cloud <type>    Microsoft cloud environment: global (default) or china (21Vianet)
+--cloud <type>    Microsoft cloud environment: global (default), china (21Vianet) or gcc-high
 --allowed-scopes <scopes> Limit exposed tools to Graph scopes covered by this allowlist
 --extra-scopes <scopes> Append additional Graph scopes to the token request (for use with your own app registration + graph-batch)
 --expected-username <username> Require local MSAL auth to use this account username
@@ -695,6 +698,8 @@ When running as an MCP server, the following options can be used:
 --http-local-file-tools Register download-bytes-to-file over HTTP. Anyone who can reach the port
                   can write files as the server's user (without a valid token, only an empty
                   file that is removed again), so enable it only on a single-user machine.
+                  With MS365_MCP_UPLOAD_DIRS set it also registers upload-attachment-from-file,
+                  which reads files from those directories.
                   Refused unless --http binds a loopback host with no --public-url and no
                   --trust-proxy-auth
 --enable-auth-tools Enable login/logout tools when using HTTP mode (disabled by default in HTTP mode)
@@ -713,6 +718,8 @@ When running as an MCP server, the following options can be used:
 --preset <names>  Use preset tool categories (comma-separated). See "Tool Presets" section above
 --list-presets    List all available presets and exit
 --toon            (experimental) Enable TOON output format for 30-60% token reduction
+--blob-output     File download tools answer an MCP EmbeddedResource with the file instead of
+                  base64 JSON in a text block (see MS365_MCP_BLOB_OUTPUT below)
 --discovery       Dynamic tool discovery: loads tools on demand to reduce initial token usage (see "Dynamic Tool Discovery" above)
 --public-url <url> Public base URL for OAuth when behind a reverse proxy (see Open WebUI section and docs/deployment.md)
 ```
@@ -728,15 +735,20 @@ Environment variables:
 - `MS365_MCP_MAX_PAGES=<n>`: Maximum number of pages followed when a tool is called with `fetchAllPages: true` (positive integer, default `100`). Bounds memory and latency for large result sets.
 - `MS365_MCP_MAX_ITEMS=<n>`: Maximum number of items accumulated when `fetchAllPages: true` (positive integer, default `10000`). Pagination stops and the response is truncated once this many items are collected.
 - `MS365_MCP_ALLOW_PAGINATION=0|false|no`: Disable multi-page following entirely. When set, the `fetchAllPages` parameter is not advertised on tools, and any request that still passes it returns only the first page (default: pagination enabled).
+- `MS365_MCP_BLOB_OUTPUT=true|1`: File download tools (`download-bytes`, `get-mail-message-mime`, `get-shared-mailbox-message-mime`, `get-mail-attachment-content`, `get-shared-mailbox-attachment-content`) answer a short JSON text block (`name`, `contentType`, `size`) and an MCP `EmbeddedResource` with `BlobResourceContents` (`uri`, `mimeType`, `blob`) instead of base64 JSON in text. The `uri`'s last segment is the optional `fileName` argument. Default: off. Alternative to the --blob-output flag.
+- `MS365_MCP_BLOB_MAX_BYTES=<n>`: With blob output on, the largest file a download tool reads (positive integer, default `5242880`). The server stops reading past it and answers an error naming the limit.
 - `MS365_MCP_BODY_FORMAT=html`: Return email bodies as HTML instead of plain text (default: text)
+- `MS365_MCP_OBO_ALLOWED_TENANTS=<ids>` / `MS365_MCP_OBO_ALLOWED_USERS=<ids>`: With `--obo`, only callers whose token `tid` (tenant id) / `oid` (user object id) is listed may use the server; others get 403 before any On-Behalf-Of exchange. Comma or space separated; unset = everyone. The claims are read without verifying the signature, which Entra verifies during the exchange, so a token that lies about them still gets no Graph token. A token Entra rejects at the exchange (bad signature, expired, wrong audience, consent needed) gets 401 with a `WWW-Authenticate` challenge so the client signs in again
+- `MS365_MCP_READ_MAIL_TEXT_MAX_CHARS=<n>`: Largest result `read-mail-text` returns, in characters (default `80000`). A larger result is refused whole, naming the largest messages, rather than cut (see Reading Mail as Clean Text below)
 - `MS365_MCP_MESSAGE_SIGNOFF_PREFIX=<text>`: Signoff prepended to outgoing messages so recipients can tell they were agent-sent, e.g. `🤖`. Default: none. CLI equivalent: `--message-signoff-prefix <text>` (see Message Signoff below)
 - `MS365_MCP_MESSAGE_SIGNOFF_SUFFIX=<text>`: Signoff appended to outgoing messages. Default: none. CLI equivalent: `--message-signoff-suffix <text>`. `--no-message-signoff` disables both (see Message Signoff below)
 - `MS365_MCP_RATE_LIMIT_DISABLED=true|1`: Disable per-IP rate limiting in HTTP mode (default: enabled — 30 req/min on `/authorize`, `/token`, `/register`; 120 req/min on `/mcp`)
 - `MS365_MCP_TRUST_PROXY_HOPS=<n>`: Number of trusted reverse-proxy hops in HTTP mode (default `1`). Accurate per-IP rate limiting depends on this matching your deployment — set to the number of proxies in front of the server, `0` to use the raw socket peer IP, or a comma-separated subnet list
 - `MS365_MCP_ATTACHMENT_PORT=<port>`: Serve the attachment route on its own listener on this port (alternative to --attachment-port; requires `--enable-attachment-urls`)
 - `MS365_MCP_ATTACHMENT_HOST=<host>`: Interface the `MS365_MCP_ATTACHMENT_PORT` listener binds (alternative to --attachment-host; requires `--attachment-port`). Defaults to the host `--http` bound — which for a wildcard `--http` means both ports answer everywhere and the port split isolates nothing. See "Splitting the attachment listener"
-- `MS365_MCP_HTTP_LOCAL_FILE_TOOLS=true|1`: Register download-bytes-to-file over HTTP (alternative to --http-local-file-tools; same restrictions)
-- `MS365_MCP_CLOUD_TYPE=global|china`: Microsoft cloud environment (alternative to --cloud flag)
+- `MS365_MCP_HTTP_LOCAL_FILE_TOOLS=true|1`: Register download-bytes-to-file, and upload-attachment-from-file when `MS365_MCP_UPLOAD_DIRS` is set, over HTTP (alternative to --http-local-file-tools; same restrictions)
+- `MS365_MCP_UPLOAD_DIRS=<dirs>`: Directories `upload-attachment-from-file` may read from, as absolute paths separated like `PATH`. Unset (the default) leaves the tool unregistered. See "Attaching a local file in stdio mode"
+- `MS365_MCP_CLOUD_TYPE=global|china|gcc-high`: Microsoft cloud environment (alternative to --cloud flag)
 - `MS365_MCP_GRAPH_BASE_URL=<url>`: Send Graph API requests to this base URL instead of the cloud's `graph.microsoft.com` (e.g. `http://127.0.0.1:10255/tenant-a/graph` for an egress proxy that originates TLS itself). Absolute http(s) URL without query or fragment; a path prefix is kept, so requests go to `<url>/v1.0/...`. The login authority and the On-Behalf-Of token resource are unchanged. Two things bypass it: `get-download-url` returns Graph's pre-authenticated SharePoint URL, and the `302` from `/content` points straight at SharePoint, so whoever follows either connects to SharePoint directly; if you control egress, allow those SharePoint hosts or disable those tools. Not read from `.env`
 - `LOG_LEVEL`: Set logging level (default: 'info')
 - `SILENT=true|1`: Disable console output
@@ -751,6 +763,46 @@ Environment variables:
 - `MS365_MCP_AUTH_CACHE_COMMAND_TIMEOUT_MS`: Per-invocation timeout for `MS365_MCP_AUTH_CACHE_COMMAND` (default: `10000`)
 - `MS365_MCP_EXPECTED_USERNAME`: Require local MSAL auth to use this Microsoft account username (case-insensitive; CLI flag takes precedence)
 - `MS365_MCP_EXPECTED_HOME_ACCOUNT_ID`: Require local MSAL auth to use this exact MSAL homeAccountId (CLI flag takes precedence)
+
+## Reading Mail as Clean Text
+
+`read-mail-text` returns messages as text with the bulk junk removed. Graph's
+plain-text body is still mostly not the message: links are wrapped in Safe Links
+or tracking redirects several hundred characters long, marketing mail pads its
+preheader with invisible characters, images become `[https://…png]` lines, and
+replies carry the whole quoted thread. On a real mailbox, 20 inbox messages came
+to about 280,000 characters through `list-mail-messages` and 70,000 through
+`read-mail-text`.
+
+The rule is: remove obvious junk, never cut or rewrite the message; anything
+ambiguous is kept. It removes runs of invisible padding characters, image
+placeholders (a bracketed address of an image file), and quoted reply history
+from its header down (a dated `On … wrote:`, also `>`-quoted, an Outlook
+`From:/Sent:` block, `-----Original Message-----`). Forwards keep the forwarded
+content: a subject starting `FW:` / `Fwd:` or a localised prefix (`VS:`, `WG:`,
+`TR:`, `RV:`, `I:`, `ENC:`, …, also after tags such as `[EXTERNAL]`), or history
+directly under a `Forwarded message` / `Begin forwarded message:` marker. Links are kept:
+Safe Links, Proofpoint URL Defense and Google redirects are unwrapped to the real
+address, tracking parameters (`utm_*` and similar) are dropped, and only an
+address still longer than 300 characters (a tracking redirect) is shortened to
+`⟦link: domain⟧`. Line endings become `\n`, and the marker brackets are
+reserved: a body's own `⟦ ⟧` appear as `[ ]`, so text cannot pose as a marker.
+Everything else — signatures, footers, whitespace, repeated links — is left as
+the message has it. `get-mail-message` returns the raw body.
+
+- `messageIds` (up to 20, one `$batch`), or `folderId` with optional `top`
+  (max 20), `filter` or `search`.
+- Each message is cut to `maxChars` characters, default 3,000 (marked
+  `truncated`): a page of 20 then fits the result limit, and a typical message
+  is whole. Ticket systems that repeat their history in every update put the
+  newest entry first, so the cut keeps it. Pass a larger `maxChars` (up to
+  300,000; a raw body beyond that is cleaned only that far) for the whole of a
+  long message; `get-mail-message` has the raw body.
+- Returns `[{ id, from, to, cc, subject, received, hasAttachments, text, chars, truncated }]`;
+  an unknown id comes back as `{ id, error }`.
+- A result over `MS365_MCP_READ_MAIL_TEXT_MAX_CHARS` (default 80,000) is refused
+  whole with the largest messages listed, so the agent narrows the query instead
+  of silently getting part of it.
 
 ## Server-Minted Attachment URLs
 
@@ -804,6 +856,26 @@ through an upload session in 3.75 MiB chunks, so the server never holds more tha
 whatever the outcome, and the upload is attached as the identity that minted it, exactly as
 downloads are fetched. An upload ticket presented to `GET` (or a download ticket to `PUT`)
 is refused with the same 404 as any other bad ticket.
+
+### Attaching a local file in stdio mode
+
+In stdio mode the server and the files are on the same machine, so no URL is needed.
+`upload-attachment-from-file` takes the same `target` and an absolute `filePath`, reads the
+file from disk and attaches it, with the same 3 MB and 150 MB limits. It is the upload
+counterpart of `download-bytes-to-file`.
+
+The tool is off until you list the directories it may read from:
+
+```
+MS365_MCP_UPLOAD_DIRS=/Users/me/Documents/invitations:/Users/me/Scans
+```
+
+Entries are absolute paths, separated like `PATH` (`:` on macOS and Linux, `;` on Windows).
+A file outside them is refused, and symlinks are resolved first, so a link inside an allowed
+directory cannot point the read somewhere else. The variable is not read from `.env`.
+
+Over HTTP the tool is registered only with `--http-local-file-tools`, like
+`download-bytes-to-file`.
 
 ### Configuration
 
