@@ -39,4 +39,12 @@ describe('buildMcpServerInstructions', () => {
     );
     expect(s).toContain('relative Microsoft Graph paths, not absolute URLs');
   });
+
+  it('only recommends $select where the tool offers it', () => {
+    for (const discovery of [false, true]) {
+      const s = buildMcpServerInstructions({ ...baseCtx, discovery });
+      expect(s).not.toContain('modest $top (or top) and $select');
+      expect(s).toContain('$select where the tool schema offers it');
+    }
+  });
 });
