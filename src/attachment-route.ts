@@ -36,6 +36,7 @@ import {
   isPlainGraphPath,
   TICKET_PARAM,
 } from './lib/attachment-tickets.js';
+import { MAX_UPLOAD_BYTES, uploadAttachment } from './lib/attachment-upload.js';
 
 export interface AttachmentRouteDeps {
   store: AttachmentTicketStore;
@@ -109,6 +110,35 @@ export function forceAttachment(header: string | null): string {
   if (extended) return `attachment; filename*=${extended}`;
   if (filename) return `attachment; filename=${filename}`;
   return 'attachment';
+}
+
+/** Types Graph answers with when it has nothing better; a probed type may replace them. */
+const GENERIC_CONTENT_TYPES = new Set(['application/octet-stream', 'application/binary', '']);
+
+/** What Node's setHeader accepts in a value: tab, printable ASCII and Latin-1. */
+const HEADER_SAFE_CHAR = /^[\t\x20-\x7e\x80-\xff]*$/;
+
+/**
+ * `attachment` naming a probed filename, which is untrusted metadata. `filename=` is
+ * header-safe with quote-breaking characters dropped (keeping the extension when nothing else
+ * survives); `filename*=` (RFC 5987) carries the real name when it is not header-safe.
+ */
+function dispositionForProbedName(name: string): string {
+  const safe = name
+    .replace(/[\r\n"\\]/g, '')
+    .replace(/[^\t\x20-\x7e\x80-\xff]/g, '')
+    .trim();
+  const extension = /(\.[A-Za-z0-9]{1,10})$/.exec(name)?.[1] ?? '';
+  const fallback = safe && safe !== extension ? safe : extension ? `attachment${extension}` : safe;
+  let value = `attachment; filename="${fallback || 'attachment'}"`;
+  if (!HEADER_SAFE_CHAR.test(name)) {
+    const encoded = encodeURIComponent(name).replace(
+      /['()*]/g,
+      (char) => '%' + char.charCodeAt(0).toString(16).toUpperCase()
+    );
+    value += `; filename*=UTF-8''${encoded}`;
+  }
+  return value;
 }
 
 function refuse(res: Response): void {
@@ -185,7 +215,18 @@ export function createAttachmentHandler(deps: AttachmentRouteDeps): Handler {
     }
 
     res.status(200);
-    res.setHeader('content-type', stream.contentType);
+    // Graph's own type wins unless it is the generic default; then the type its metadata
+    // gave at mint time, if it can be sent as a header.
+    const probed =
+      ticket.probedContentType && HEADER_SAFE_CHAR.test(ticket.probedContentType)
+        ? ticket.probedContentType
+        : undefined;
+    res.setHeader(
+      'content-type',
+      probed && GENERIC_CONTENT_TYPES.has(stream.contentType.split(';')[0].trim().toLowerCase())
+        ? probed
+        : stream.contentType
+    );
     if (stream.contentLength !== null) {
       res.setHeader('content-length', String(stream.contentLength));
     }
@@ -193,7 +234,12 @@ export function createAttachmentHandler(deps: AttachmentRouteDeps): Handler {
     // endpoint serves untrusted bytes from a mailbox, and a browser that
     // wandered onto the URL must not render an inline text/html attachment as
     // a page on this origin.
-    res.setHeader('content-disposition', forceAttachment(stream.contentDisposition));
+    res.setHeader(
+      'content-disposition',
+      !stream.contentDisposition && ticket.probedName
+        ? dispositionForProbedName(ticket.probedName)
+        : forceAttachment(stream.contentDisposition)
+    );
     res.setHeader('cache-control', 'no-store');
     res.setHeader('x-content-type-options', 'nosniff');
 
@@ -212,40 +258,6 @@ export function createAttachmentHandler(deps: AttachmentRouteDeps): Handler {
 // ---------------------------------------------------------------------------
 // Upload: PUT /attachment?t=<ticket>  (raw file bytes, Content-Length required)
 // ---------------------------------------------------------------------------
-
-/** Graph attaches up to 150 MB to a message or event. */
-export const MAX_UPLOAD_BYTES = 150 * 1024 * 1024;
-/** Below this Graph takes the bytes inline as base64 contentBytes; at or above it needs an upload session. */
-const INLINE_UPLOAD_LIMIT = 3 * 1024 * 1024;
-/** Upload-session chunk: a multiple of 320 KiB, as Graph requires. */
-const UPLOAD_CHUNK_BYTES = 320 * 1024 * 12;
-
-interface UploadSessionResponse {
-  uploadUrl?: string;
-}
-
-async function putChunk(
-  uploadUrl: string,
-  chunk: Buffer,
-  start: number,
-  total: number
-): Promise<void> {
-  const end = start + chunk.length - 1;
-  const response = await fetch(uploadUrl, {
-    method: 'PUT',
-    headers: {
-      'Content-Type': 'application/octet-stream',
-      'Content-Length': String(chunk.length),
-      'Content-Range': `bytes ${start}-${end}/${total}`,
-    },
-    // A standalone ArrayBuffer: fetch's body typing wants a BufferSource, and a
-    // Buffer view over a pooled slab is neither the right type nor the right bytes.
-    body: chunk.buffer.slice(chunk.byteOffset, chunk.byteOffset + chunk.byteLength) as ArrayBuffer,
-  });
-  if (![200, 201, 202].includes(response.status)) {
-    throw new Error(`Upload session chunk ${start}-${end} answered HTTP ${response.status}`);
-  }
-}
 
 /**
  * Redeem an upload ticket: the request body is the file, and it becomes an
@@ -319,66 +331,18 @@ export function createAttachmentUploadHandler(deps: AttachmentRouteDeps): Handle
     res.setHeader('x-content-type-options', 'nosniff');
 
     try {
-      if (declared < INLINE_UPLOAD_LIMIT) {
-        const chunks: Buffer[] = [];
-        let received = 0;
-        for await (const chunk of req) {
-          received += (chunk as Buffer).length;
-          if (received > declared) throw new Error('Body exceeds Content-Length');
-          chunks.push(chunk as Buffer);
-        }
-        if (received !== declared) throw new Error('Body shorter than Content-Length');
-        const created = (await graphClient.makeRequest(ticket.target, {
-          method: 'POST',
+      const created = await uploadAttachment(
+        graphClient,
+        {
+          target: ticket.target,
+          name: ticket.name,
+          contentType: ticket.contentType,
+          size: declared,
           accessToken,
-          body: JSON.stringify({
-            '@odata.type': '#microsoft.graph.fileAttachment',
-            name: ticket.name,
-            contentType: ticket.contentType,
-            contentBytes: Buffer.concat(chunks).toString('base64'),
-          }),
-        })) as { id?: string };
-        res.status(201).json({ ok: true, name: ticket.name, size: declared, id: created?.id });
-        return;
-      }
-
-      const session = (await graphClient.makeRequest(`${ticket.target}/createUploadSession`, {
-        method: 'POST',
-        accessToken,
-        body: JSON.stringify({
-          AttachmentItem: {
-            attachmentType: 'file',
-            name: ticket.name,
-            size: declared,
-            contentType: ticket.contentType,
-          },
-        }),
-      })) as UploadSessionResponse;
-      if (!session?.uploadUrl) throw new Error('Upload session returned no uploadUrl');
-
-      let pending: Buffer[] = [];
-      let pendingBytes = 0;
-      let offset = 0;
-      for await (const piece of req) {
-        pending.push(piece as Buffer);
-        pendingBytes += (piece as Buffer).length;
-        if (offset + pendingBytes > declared) throw new Error('Body exceeds Content-Length');
-        while (pendingBytes >= UPLOAD_CHUNK_BYTES) {
-          const joined = Buffer.concat(pending);
-          const chunk = joined.subarray(0, UPLOAD_CHUNK_BYTES);
-          await putChunk(session.uploadUrl, chunk, offset, declared);
-          offset += chunk.length;
-          const rest = joined.subarray(UPLOAD_CHUNK_BYTES);
-          pending = rest.length ? [Buffer.from(rest)] : [];
-          pendingBytes = rest.length;
-        }
-      }
-      if (pendingBytes > 0) {
-        await putChunk(session.uploadUrl, Buffer.concat(pending), offset, declared);
-        offset += pendingBytes;
-      }
-      if (offset !== declared) throw new Error('Body shorter than Content-Length');
-      res.status(201).json({ ok: true, name: ticket.name, size: declared });
+        },
+        req
+      );
+      res.status(201).json({ ok: true, name: ticket.name, size: declared, id: created.id });
     } catch (error) {
       logger.error(`Attachment upload failed for ${ticket.target}: ${(error as Error).message}`);
       if (!res.headersSent) res.status(502).type('text/plain').send('Upstream upload failed');

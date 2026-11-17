@@ -1,4 +1,12 @@
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'fs';
+import {
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -1389,21 +1397,21 @@ describe('graph-tools', () => {
     });
 
     it.each(['list-calendar-events-delta', 'list-calendar-view-delta'])(
-      'ignores stale mixed-case top values for %s',
+      'rejects mixed-case top values before Graph dispatch for %s',
       async (alias) => {
         mockEndpoints.push(makeEndpoint({ alias }));
-        mockEndpointsJson = [makeConfig({ toolName: alias })];
+        mockEndpointsJson = [
+          makeConfig({ toolName: alias, queryParams: ['startDateTime', 'skiptoken'] }),
+        ];
         const graphClient = createMockGraphClient();
         const server = createMockServer();
         const { registerGraphTools } = await loadModule();
         registerGraphTools(server as any, graphClient as any);
         for (const key of ['top', '$top', 'TOP', '$TOP', '$Top']) {
-          await server.tools.get(alias)!.handler({ [key]: 10 });
+          const result = await server.tools.get(alias)!.handler({ [key]: 10 });
+          expect(result.isError).toBe(true);
         }
-        expect(graphClient.graphRequest).toHaveBeenCalledTimes(5);
-        for (const call of graphClient.graphRequest.mock.calls) {
-          expect(JSON.stringify(call)).not.toContain('$top');
-        }
+        expect(graphClient.graphRequest).not.toHaveBeenCalled();
       }
     );
 
@@ -1411,7 +1419,7 @@ describe('graph-tools', () => {
       'rejects unsupported query options before Graph dispatch for %s',
       async (alias) => {
         mockEndpoints.push(makeEndpoint({ alias }));
-        mockEndpointsJson = [makeConfig({ toolName: alias })];
+        mockEndpointsJson = [makeConfig({ toolName: alias, queryParams: [] })];
         const graphClient = createMockGraphClient();
         const server = createMockServer();
         const { registerGraphTools } = await loadModule();
@@ -1427,7 +1435,7 @@ describe('graph-tools', () => {
 
     it('rejects oversized chat pages before Graph dispatch, including dollar-prefixed input', async () => {
       mockEndpoints.push(makeEndpoint({ alias: 'list-chats' }));
-      mockEndpointsJson = [makeConfig({ toolName: 'list-chats' })];
+      mockEndpointsJson = [makeConfig({ toolName: 'list-chats', maxTop: 50 })];
       const graphClient = createMockGraphClient();
       const server = createMockServer();
       const { registerGraphTools } = await loadModule();
@@ -1440,7 +1448,7 @@ describe('graph-tools', () => {
     });
 
     it('sends a calendar field array as comma-separated text in one Graph request', async () => {
-      const alias = 'list-calendar-events-delta';
+      const alias = 'list-calendar-events';
       mockEndpoints.push(makeEndpoint({ alias }));
       mockEndpointsJson = [makeConfig({ toolName: alias })];
       const graphClient = createMockGraphClient();
@@ -1507,8 +1515,8 @@ describe('graph-tools', () => {
     });
 
     it('keeps skiptoken on delta tools that have $top stripped', async () => {
-      // list-calendar-events-delta pages via cursor but is in TOP_UNSUPPORTED_DELTA_TOOLS,
-      // so a $top-only test would strip the cursor from an endpoint that needs it.
+      // list-calendar-events-delta pages via cursor but supports none of the collection
+      // options, so guessing from the schema alone would strip the cursor it needs.
       const endpoint = makeEndpoint({
         alias: 'list-calendar-events-delta',
         path: '/me/calendarView/delta',
@@ -1518,6 +1526,7 @@ describe('graph-tools', () => {
         makeConfig({
           toolName: 'list-calendar-events-delta',
           pathPattern: '/me/calendarView/delta',
+          queryParams: ['startDateTime', 'skiptoken'],
         })
       );
 
@@ -2775,6 +2784,33 @@ describe('graph-tools', () => {
       // the Content-Type Graph reports (application/msword is not on the allowlist).
       expect(options.forceBinary).toBe(true);
       expect(options.rawResponse).toBe(true);
+      expect(options.blobOutput).toBeUndefined();
+      expect(options.maxBytes).toBeUndefined();
+    });
+
+    it('asks for a capped blob resource when blob output is on', async () => {
+      mockEndpoints.length = 0;
+      mockEndpointsJson = [];
+      process.env.MS365_MCP_BLOB_OUTPUT = 'true';
+      process.env.MS365_MCP_BLOB_MAX_BYTES = '1234';
+      try {
+        const graphClient = { graphRequest: vi.fn().mockResolvedValue({ content: [] }) };
+        const server = createMockServer();
+        const { registerGraphTools } = await loadModule();
+        registerGraphTools(server as any, graphClient as any);
+
+        await server.tools
+          .get('download-bytes')!
+          .handler({ target: '/me/messages/m1/attachments/a1/$value', fileName: 'drawing.pdf' });
+
+        const [, options] = graphClient.graphRequest.mock.calls[0];
+        expect(options.forceBinary).toBe(true);
+        expect(options.maxBytes).toBe(1234);
+        expect(options.blobOutput).toEqual({ fileName: 'drawing.pdf' });
+      } finally {
+        delete process.env.MS365_MCP_BLOB_OUTPUT;
+        delete process.env.MS365_MCP_BLOB_MAX_BYTES;
+      }
     });
 
     it('rejects absolute URLs (Graph paths only)', async () => {
@@ -3009,6 +3045,178 @@ describe('graph-tools', () => {
       registerGraphTools(httpServer as any, {} as any, { httpMode: true });
       expect(httpServer.tools.has('download-bytes-to-file')).toBe(false);
       expect(httpServer.tools.has('download-bytes')).toBe(true);
+    });
+  });
+
+  // ---- 9a2. upload-attachment-from-file utility tool ----
+  describe('upload-attachment-from-file', () => {
+    const TOOL = 'upload-attachment-from-file';
+    const TARGET = '/me/events/evt1/attachments';
+    let tmpDir: string;
+    let allowed: string;
+
+    beforeEach(() => {
+      mockEndpoints.length = 0;
+      mockEndpointsJson = [];
+      tmpDir = realpathSync(mkdtempSync(join(tmpdir(), 'uaff-')));
+      allowed = join(tmpDir, 'allowed');
+      mkdirSync(allowed);
+      process.env.MS365_MCP_UPLOAD_DIRS = allowed;
+    });
+
+    afterEach(() => {
+      delete process.env.MS365_MCP_UPLOAD_DIRS;
+      vi.unstubAllGlobals();
+      rmSync(tmpDir, { recursive: true, force: true });
+    });
+
+    async function register(graphClient: unknown, options?: Record<string, unknown>) {
+      const server = createMockServer();
+      const { registerGraphTools } = await loadModule();
+      registerGraphTools(server as any, graphClient as any, options as any);
+      return server;
+    }
+
+    it('is not registered unless MS365_MCP_UPLOAD_DIRS is set', async () => {
+      delete process.env.MS365_MCP_UPLOAD_DIRS;
+      const server = await register({});
+      expect(server.tools.has(TOOL)).toBe(false);
+      expect(server.tools.has('download-bytes-to-file')).toBe(true);
+    });
+
+    it('is not registered in read-only mode or over HTTP', async () => {
+      expect((await register({}, { readOnly: true })).tools.has(TOOL)).toBe(false);
+      expect((await register({}, { httpMode: true })).tools.has(TOOL)).toBe(false);
+    });
+
+    it('attaches a small file inline, named after the file', async () => {
+      const bytes = Buffer.from([0x25, 0x50, 0x44, 0x46, 0x00, 0xff]);
+      writeFileSync(join(allowed, 'invitation.pdf'), bytes);
+      const graphClient = { makeRequest: vi.fn().mockResolvedValue({ id: 'att1' }) };
+      const server = await register(graphClient);
+
+      const result = await server.tools
+        .get(TOOL)!
+        .handler({ target: TARGET, filePath: join(allowed, 'invitation.pdf') });
+
+      expect(result.isError).toBeUndefined();
+      expect(JSON.parse(result.content[0].text)).toEqual({
+        name: 'invitation.pdf',
+        size: bytes.length,
+        id: 'att1',
+      });
+      expect(graphClient.makeRequest).toHaveBeenCalledTimes(1);
+      const [reqPath, options] = graphClient.makeRequest.mock.calls[0];
+      expect(reqPath).toBe(TARGET);
+      expect(options.method).toBe('POST');
+      expect(JSON.parse(options.body)).toEqual({
+        '@odata.type': '#microsoft.graph.fileAttachment',
+        name: 'invitation.pdf',
+        contentType: 'application/octet-stream',
+        contentBytes: bytes.toString('base64'),
+      });
+      expect(auditLogMock).toHaveBeenCalledWith(
+        expect.objectContaining({ event: 'tool.call', tool: TOOL, status: 'success' })
+      );
+    });
+
+    it('uses the given name and content type', async () => {
+      writeFileSync(join(allowed, 'scan-0042.bin'), 'x');
+      const graphClient = { makeRequest: vi.fn().mockResolvedValue({ id: 'att1' }) };
+      const server = await register(graphClient);
+
+      await server.tools.get(TOOL)!.handler({
+        target: '/me/messages/msg1/attachments',
+        filePath: join(allowed, 'scan-0042.bin'),
+        name: 'flyer.pdf',
+        contentType: 'application/pdf',
+      });
+
+      const body = JSON.parse(graphClient.makeRequest.mock.calls[0][1].body);
+      expect(body.name).toBe('flyer.pdf');
+      expect(body.contentType).toBe('application/pdf');
+    });
+
+    it('sends a file of 3 MB or more through an upload session in chunks', async () => {
+      const size = 4 * 1024 * 1024 + 123;
+      const bytes = Buffer.alloc(size, 7);
+      writeFileSync(join(allowed, 'big.bin'), bytes);
+      const graphClient = {
+        makeRequest: vi.fn().mockResolvedValue({ uploadUrl: 'https://upload.example/session' }),
+      };
+      const ranges: string[] = [];
+      let uploaded = 0;
+      vi.stubGlobal(
+        'fetch',
+        vi.fn(
+          async (_url: string, init: { headers: Record<string, string>; body: ArrayBuffer }) => {
+            ranges.push(init.headers['Content-Range']);
+            uploaded += init.body.byteLength;
+            return new Response(null, { status: 202 });
+          }
+        )
+      );
+      const server = await register(graphClient);
+
+      const result = await server.tools
+        .get(TOOL)!
+        .handler({ target: TARGET, filePath: join(allowed, 'big.bin') });
+
+      expect(result.isError).toBeUndefined();
+      expect(JSON.parse(result.content[0].text)).toEqual({ name: 'big.bin', size });
+      const [reqPath, options] = graphClient.makeRequest.mock.calls[0];
+      expect(reqPath).toBe(`${TARGET}/createUploadSession`);
+      expect(JSON.parse(options.body).AttachmentItem).toMatchObject({ name: 'big.bin', size });
+      const chunk = 320 * 1024 * 12;
+      expect(ranges).toEqual([
+        `bytes 0-${chunk - 1}/${size}`,
+        `bytes ${chunk}-${size - 1}/${size}`,
+      ]);
+      expect(uploaded).toBe(size);
+    });
+
+    it('refuses a file outside the allowed directories, also through a symlink', async () => {
+      writeFileSync(join(tmpDir, 'secret.txt'), 'secret');
+      symlinkSync(join(tmpDir, 'secret.txt'), join(allowed, 'link.txt'));
+      const graphClient = { makeRequest: vi.fn() };
+      const server = await register(graphClient);
+
+      for (const filePath of [join(tmpDir, 'secret.txt'), join(allowed, 'link.txt')]) {
+        const result = await server.tools.get(TOOL)!.handler({ target: TARGET, filePath });
+        expect(result.isError).toBe(true);
+        expect(JSON.parse(result.content[0].text).error).toMatch(/does not exist or is outside/);
+      }
+      expect(graphClient.makeRequest).not.toHaveBeenCalled();
+    });
+
+    it('refuses an empty file and a target that is not an attachments collection', async () => {
+      writeFileSync(join(allowed, 'empty.txt'), '');
+      writeFileSync(join(allowed, 'a.txt'), 'a');
+      const graphClient = { makeRequest: vi.fn() };
+      const server = await register(graphClient);
+      const call = async (args: Record<string, unknown>) =>
+        JSON.parse((await server.tools.get(TOOL)!.handler(args)).content[0].text).error;
+
+      expect(await call({ target: TARGET, filePath: join(allowed, 'empty.txt') })).toMatch(
+        /file is empty/
+      );
+      expect(
+        await call({ target: '/me/drive/root:/a.txt:/content', filePath: join(allowed, 'a.txt') })
+      ).toMatch(/attachments collection/);
+      expect(graphClient.makeRequest).not.toHaveBeenCalled();
+    });
+
+    it('answers a Graph failure as a tool error', async () => {
+      writeFileSync(join(allowed, 'a.txt'), 'a');
+      const graphClient = { makeRequest: vi.fn().mockRejectedValue(new Error('Graph said no')) };
+      const server = await register(graphClient);
+
+      const result = await server.tools
+        .get(TOOL)!
+        .handler({ target: TARGET, filePath: join(allowed, 'a.txt') });
+
+      expect(result.isError).toBe(true);
+      expect(JSON.parse(result.content[0].text).error).toBe('Graph said no');
     });
   });
 
@@ -4890,6 +5098,382 @@ describe('graph-tools', () => {
       const { isDestructiveOperation } = await loadModule();
       expect(isDestructiveOperation('PATCH', { readOnly: true } as any)).toBe(true);
       expect(isDestructiveOperation('DELETE', { readOnly: true } as any)).toBe(true);
+    });
+  });
+
+  describe('rewriteMentionShorthand', () => {
+    const U1 = '11111111-2222-3333-4444-555555555555';
+    const U2 = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
+    const html = (content: string, extra: Record<string, unknown> = {}) => ({
+      body: { contentType: 'html', content },
+      ...extra,
+    });
+    const mention = (id: number, userId: string, name: string) => ({
+      id,
+      mentionText: name,
+      mentioned: { user: { id: userId, displayName: name, userIdentityType: 'aadUser' } },
+    });
+
+    it('rewrites one tag and builds the mentions array', async () => {
+      const { rewriteMentionShorthand } = await loadModule();
+      expect(rewriteMentionShorthand(html(`Hi <at user-id="${U1}">Jane Doe</at>!`)).body).toEqual(
+        html('Hi <at id="0">Jane Doe</at>!', { mentions: [mention(0, U1, 'Jane Doe')] })
+      );
+    });
+
+    it('numbers several tags in order, including a repeated user', async () => {
+      const { rewriteMentionShorthand } = await loadModule();
+      const out = rewriteMentionShorthand(
+        html(
+          `<at user-id="${U1}">Jane</at> <at user-id="${U2}">Bob</at> <at user-id="${U1}">Jane</at>`
+        )
+      ).body as any;
+      expect(out.body.content).toBe(
+        '<at id="0">Jane</at> <at id="1">Bob</at> <at id="2">Jane</at>'
+      );
+      expect(out.mentions.map((m: any) => m.id)).toEqual([0, 1, 2]);
+    });
+
+    it('starts above ids already in the content and mentions', async () => {
+      const { rewriteMentionShorthand } = await loadModule();
+      const input = html(`<at id="0">Old</at> <at user-id="${U1}">Jane</at>`, {
+        mentions: [mention(0, U2, 'Old')],
+      });
+      const out = rewriteMentionShorthand(input).body as any;
+      expect(out.body.content).toBe('<at id="0">Old</at> <at id="1">Jane</at>');
+      expect(out.mentions).toEqual([mention(0, U2, 'Old'), mention(1, U1, 'Jane')]);
+    });
+
+    it('passes a correct hand-built body through unchanged', async () => {
+      const { rewriteMentionShorthand } = await loadModule();
+      const input = html('<at id="0">Jane</at>', { mentions: [mention(0, U1, 'Jane')] });
+      expect(rewriteMentionShorthand(input).body).toBe(input);
+    });
+
+    it('returns an error for a user-id that is not a GUID', async () => {
+      const { rewriteMentionShorthand } = await loadModule();
+      const input = html('<at user-id="jane@contoso.com">Jane</at>');
+      const out = rewriteMentionShorthand(input);
+      expect(out.error).toContain('jane@contoso.com');
+      expect(out.body).toBe(input);
+    });
+
+    it('leaves non-html content without the shorthand alone', async () => {
+      const { rewriteMentionShorthand } = await loadModule();
+      const text = { body: { contentType: 'text', content: 'plain words' } };
+      const bare = { body: { content: 'plain words' } };
+      expect(rewriteMentionShorthand(text).body).toBe(text);
+      expect(rewriteMentionShorthand(bare).body).toBe(bare);
+    });
+
+    it.each([
+      ['text', { contentType: 'text' }],
+      ['missing', {}],
+    ])('returns an error for the shorthand when contentType is %s', async (_label, type) => {
+      const { rewriteMentionShorthand } = await loadModule();
+      const input = { body: { ...type, content: `<at user-id="${U1}">Jane</at>` } };
+      const out = rewriteMentionShorthand(input);
+      expect(out.error).toContain('contentType');
+      expect(out.body).toBe(input);
+    });
+
+    it.each([
+      ['single-quoted user-id', `<at user-id='${U1}'>Jane</at>`],
+      ['spaces around =', `<at user-id = "${U1}">Jane</at>`],
+      ['an extra attribute', `<at user-id="${U1}" class="x">Jane</at>`],
+      ['nested markup in the name', `<at user-id="${U1}"><b>Jane</b></at>`],
+    ])('returns an error for an unsupported tag form: %s', async (_label, tag) => {
+      const { rewriteMentionShorthand } = await loadModule();
+      const input = html(`Hi ${tag}`);
+      const out = rewriteMentionShorthand(input);
+      expect(out.error).toContain('Unsupported mention tag form');
+      expect(out.body).toBe(input);
+    });
+
+    it('leaves a raw string body alone', async () => {
+      const { rewriteMentionShorthand } = await loadModule();
+      expect(rewriteMentionShorthand('{"body":{}}').body).toBe('{"body":{}}');
+      expect(rewriteMentionShorthand(null).body).toBeNull();
+    });
+
+    it('keeps the display name verbatim', async () => {
+      const { rewriteMentionShorthand } = await loadModule();
+      const out = rewriteMentionShorthand(html(`<at user-id="${U1}">Smith &amp; Co</at>`))
+        .body as any;
+      expect(out.body.content).toBe('<at id="0">Smith &amp; Co</at>');
+      expect(out.mentions[0].mentionText).toBe('Smith &amp; Co');
+    });
+  });
+
+  describe('mention shorthand (tool wiring)', () => {
+    const U1 = '11111111-2222-3333-4444-555555555555';
+    const aliases = [
+      ['send-channel-message', 'post'],
+      ['reply-to-channel-message', 'post'],
+      ['update-channel-message', 'patch'],
+      ['update-channel-message-reply', 'patch'],
+      ['send-chat-message', 'post'],
+      ['reply-to-chat-message', 'post'],
+      ['update-chat-message', 'patch'],
+    ] as const;
+
+    async function call(alias: string, method: string, body: unknown, flagged = true) {
+      mockEndpoints.push(
+        makeEndpoint({
+          alias,
+          method,
+          path: '/chats/{chat-id}/messages',
+          parameters: [{ name: 'body', type: 'Body', schema: z.object({}).passthrough() }],
+        })
+      );
+      mockEndpointsJson = [
+        makeConfig({
+          toolName: alias,
+          method,
+          pathPattern: '/chats/{chat-id}/messages',
+          mentionShorthand: flagged,
+        }),
+      ];
+      const graphClient = createMockGraphClient([
+        { content: [{ type: 'text', text: JSON.stringify({ id: 'm1' }) }] },
+      ]);
+      const server = createMockServer();
+      const { registerGraphTools } = await loadModule();
+      registerGraphTools(server as any, graphClient as any);
+      const result = await server.tools
+        .get(alias)!
+        .handler({ 'chat-id': 'c1', body, confirm: true });
+      return { result, graphClient };
+    }
+    const sent = (graphClient: any) => JSON.parse(graphClient.graphRequest.mock.calls[0][1].body);
+
+    it.each(aliases)('rewrites the shorthand on %s', async (alias, method) => {
+      const { graphClient } = await call(alias, method, {
+        body: { contentType: 'html', content: `Hi <at user-id="${U1}">Jane</at>` },
+      });
+      const out = sent(graphClient);
+      expect(out.body.content).toBe('Hi <at id="0">Jane</at>');
+      expect(out.mentions).toEqual([
+        {
+          id: 0,
+          mentionText: 'Jane',
+          mentioned: { user: { id: U1, displayName: 'Jane', userIdentityType: 'aadUser' } },
+        },
+      ]);
+    });
+
+    it('returns a tool error and sends nothing for a bad user-id', async () => {
+      const { result, graphClient } = await call('send-chat-message', 'post', {
+        body: { contentType: 'html', content: '<at user-id="jane">Jane</at>' },
+      });
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toContain('not an Entra object id');
+      expect(graphClient.graphRequest).not.toHaveBeenCalled();
+    });
+
+    it('does not rewrite on a tool without mentionShorthand', async () => {
+      const { graphClient } = await call(
+        'create-draft-email',
+        'post',
+        { body: { contentType: 'html', content: `<at user-id="${U1}">Jane</at>` } },
+        false
+      );
+      expect(sent(graphClient).body.content).toBe(`<at user-id="${U1}">Jane</at>`);
+    });
+
+    it('lists only tools that exist in endpoints.json and documents the shorthand', async () => {
+      // fs is mocked above to serve mockEndpointsJson for this path; read the real file
+      const actualFs = await vi.importActual<typeof import('fs')>('fs');
+      const endpoints = JSON.parse(
+        actualFs.readFileSync(join(__dirname, '..', 'endpoints.json'), 'utf8')
+      ) as Array<{ toolName: string; llmTip?: string }>;
+      for (const [alias] of aliases) {
+        const entry = endpoints.find((e) => e.toolName === alias);
+        expect(entry, alias).toBeDefined();
+        const tip = entry!.llmTip!;
+        expect(tip, alias).toContain('user-id=');
+        // the name param ships in a separate PR; this one must stand alone
+        expect(tip, alias).not.toContain('name param');
+        // conversationMember has both id (membership id) and userId (the GUID)
+        expect(tip, alias).toContain('userId');
+        // the raw form is the fallback, not a second copy of the same instruction
+        expect(tip.split('To @mention someone').length - 1, alias).toBe(1);
+      }
+    });
+  });
+
+  describe('filterMembersByName', () => {
+    const body = {
+      value: [
+        { id: '1', displayName: 'Jane Doe', email: 'jane@contoso.com' },
+        { id: '2', displayName: 'John Smith', email: 'jsmith@contoso.com' },
+        { id: '3', displayName: null, email: null },
+      ],
+      '@odata.count': 3,
+    };
+    const ids = (r: any) => r.value.map((m: any) => m.id);
+
+    it('matches displayName case-insensitively', async () => {
+      const { filterMembersByName } = await loadModule();
+      expect(ids(filterMembersByName(body, 'JANE'))).toEqual(['1']);
+    });
+
+    it('matches email', async () => {
+      const { filterMembersByName } = await loadModule();
+      expect(ids(filterMembersByName(body, 'jsmith@'))).toEqual(['2']);
+    });
+
+    it('returns an empty value array when nothing matches', async () => {
+      const { filterMembersByName } = await loadModule();
+      expect(ids(filterMembersByName(body, 'zzz'))).toEqual([]);
+    });
+
+    it('returns everything for an empty or whitespace-only name', async () => {
+      const { filterMembersByName } = await loadModule();
+      expect(ids(filterMembersByName(body, '   '))).toEqual(['1', '2', '3']);
+    });
+
+    it('does not match or throw on null fields', async () => {
+      const { filterMembersByName } = await loadModule();
+      expect(ids(filterMembersByName(body, 'null'))).toEqual([]);
+    });
+
+    it('keeps other top-level fields', async () => {
+      const { filterMembersByName } = await loadModule();
+      expect((filterMembersByName(body, 'jane') as any)['@odata.count']).toBe(3);
+    });
+
+    it('returns non-collection input unchanged', async () => {
+      const { filterMembersByName } = await loadModule();
+      expect(filterMembersByName('plain', 'x')).toBe('plain');
+      expect(filterMembersByName({ id: '1' }, 'x')).toEqual({ id: '1' });
+    });
+  });
+
+  describe('member name filter (tool wiring)', () => {
+    const membersBody = {
+      value: [
+        { id: '1', displayName: 'Jane Doe', email: 'jane@contoso.com' },
+        { id: '2', displayName: 'John Smith', email: 'jsmith@contoso.com' },
+        { id: '3', displayName: null, email: null },
+      ],
+      '@odata.count': 3,
+    };
+    const page = (b: unknown) => ({ content: [{ type: 'text', text: JSON.stringify(b) }] });
+    const ids = (result: any) => JSON.parse(result.content[0].text).value.map((m: any) => m.id);
+
+    async function run(
+      args: Record<string, unknown>,
+      responses: any[] = [page(membersBody)],
+      alias = 'list-team-members',
+      path = '/teams/{team-id}/members',
+      outputFormat: 'json' | 'toon' = 'json'
+    ) {
+      mockEndpoints.push(makeEndpoint({ alias, path }));
+      mockEndpointsJson = [makeConfig({ toolName: alias, pathPattern: path, nameFilter: true })];
+      const graphClient = createMockGraphClient(responses, outputFormat);
+      const server = createMockServer();
+      const { registerGraphTools } = await loadModule();
+      registerGraphTools(server as any, graphClient as any);
+      const result = await server.tools.get(alias)!.handler({ 'team-id': 't1', ...args });
+      return { result, graphClient };
+    }
+
+    it('filters list-team-members by name', async () => {
+      const { result } = await run({ name: 'jane' });
+      expect(ids(result)).toEqual(['1']);
+    });
+
+    it('filters list-chat-members by email', async () => {
+      const { result } = await run(
+        { 'chat-id': 'c1', name: 'jsmith' },
+        [page(membersBody)],
+        'list-chat-members',
+        '/chats/{chat-id}/members'
+      );
+      expect(ids(result)).toEqual(['2']);
+    });
+
+    it('does not send name to Graph', async () => {
+      const { graphClient } = await run({ name: 'jane' });
+      expect(graphClient.graphRequest.mock.calls[0][0]).not.toContain('name');
+    });
+
+    it('returns the full list for a whitespace-only name', async () => {
+      const { result } = await run({ name: '  ' });
+      expect(ids(result)).toEqual(['1', '2', '3']);
+    });
+
+    it('leaves an error response untouched', async () => {
+      const err = { content: [{ type: 'text', text: '{"error":"nope"}' }], isError: true };
+      const { result } = await run({ name: 'jane' }, [err]);
+      expect(result.content[0].text).toBe('{"error":"nope"}');
+    });
+
+    it('keeps @odata.count as the unfiltered total', async () => {
+      const { result } = await run({ name: 'jane' });
+      expect(JSON.parse(result.content[0].text)['@odata.count']).toBe(3);
+    });
+
+    it('filters after fetchAllPages merges the pages', async () => {
+      const { result } = await run({ name: 'ann', fetchAllPages: true }, [
+        page({
+          value: [{ id: '1', displayName: 'Ann', email: 'a@x.com' }],
+          '@odata.nextLink': 'https://graph.microsoft.com/v1.0/teams/t1/members?$skiptoken=x',
+        }),
+        page({
+          value: [
+            { id: '2', displayName: 'Bob', email: 'b@x.com' },
+            { id: '3', displayName: 'Annette', email: 'n@x.com' },
+          ],
+        }),
+      ]);
+      expect(ids(result)).toEqual(['1', '3']);
+    });
+
+    it('matches only fields that survive $select projection', async () => {
+      const { result } = await run({ select: 'id,displayName', name: 'contoso' });
+      expect(ids(result)).toEqual([]);
+    });
+
+    describe('under --toon', () => {
+      // The mock serialize() prefixes TOON: so a filter that parses serialized output throws
+      const parseToon = (result: any) => JSON.parse(result.content[0].text.replace(/^TOON:/, ''));
+      const toon = (args: Record<string, unknown>, responses = [page(membersBody)]) =>
+        run(args, responses, 'list-team-members', '/teams/{team-id}/members', 'toon');
+
+      it('filters when no projection or merge applies', async () => {
+        const { result } = await toon({ name: 'jane' });
+        expect(parseToon(result).value.map((m: any) => m.id)).toEqual(['1']);
+      });
+
+      it('filters when $select projects the body', async () => {
+        const { result } = await toon({ select: 'id,displayName', name: 'jane' });
+        expect(parseToon(result).value).toEqual([{ id: '1', displayName: 'Jane Doe' }]);
+      });
+
+      it('filters after fetchAllPages merges the pages', async () => {
+        const { result } = await toon({ name: 'ann', fetchAllPages: true }, [
+          page({
+            value: [{ id: '1', displayName: 'Ann', email: 'a@x.com' }],
+            '@odata.nextLink': 'https://graph.microsoft.com/v1.0/teams/t1/members?$skiptoken=x',
+          }),
+          page({
+            value: [
+              { id: '2', displayName: 'Bob', email: 'b@x.com' },
+              { id: '3', displayName: 'Annette', email: 'n@x.com' },
+            ],
+          }),
+        ]);
+        expect(parseToon(result).value.map((m: any) => m.id)).toEqual(['1', '3']);
+      });
+    });
+
+    it('still matches a projected field', async () => {
+      const { result } = await run({ select: 'id,displayName', name: 'jane' });
+      expect(JSON.parse(result.content[0].text).value).toEqual([
+        { id: '1', displayName: 'Jane Doe' },
+      ]);
     });
   });
 });
